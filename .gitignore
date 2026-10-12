@@ -1,0 +1,7 @@
+# secrets: never push these to GitHub
+.env
+
+# local Python files
+venv/
+__pycache__/
+*.pyc
