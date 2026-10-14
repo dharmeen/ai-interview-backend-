@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.billing.router import router as billing_router
 from src.interview.router import router as interview_router
 from src.user.router import router as auth_router, users_router
 from src.utils.settings import settings
@@ -21,3 +22,4 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(interview_router)
+app.include_router(billing_router)

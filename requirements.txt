@@ -9,3 +9,8 @@ pwdlib[argon2]==0.3.1
 email-validator==2.3.0
 PyJWT==2.15.1
 openai==3.29.0
+stripe==16.0.0
+python-multipart==0.0.32
+pypdf==6.20.1
+python-docx==1.2.0
+httpx==0.28.1

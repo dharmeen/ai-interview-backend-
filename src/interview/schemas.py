@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
 
+from fastapi import UploadFile
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.interview.models import (
@@ -35,6 +36,17 @@ class InterviewCreate(BaseModel):
         return v
 
 
+class InterviewCreateForm(InterviewCreate):
+    """POST /interviews body, sent as multipart/form-data so the CV file can come with it.
+    The file lives in the same model because FastAPI can't mix a form model with a separate File()."""
+
+    resume: UploadFile  # required: questions are based on the CV
+
+
+class RoleSuggestions(BaseModel):
+    suggestions: list[str]
+
+
 class FinalFeedback(BaseModel):
     summary: str
     strengths: list[str]
@@ -49,14 +61,17 @@ class InterviewResponse(BaseModel):
     level: InterviewLevel
     experience_years: int
     job_description: str | None
+    resume_filename: str | None  # the resume text itself is not sent back
     interview_type: InterviewType
     num_questions: int
     status: InterviewStatus
     overall_score: float | None
     topic_plan: list[str] | None
     current_question_no: int
+    current_sub_no: int  # 1 while a follow-up to current_question_no is waiting for an answer
     switch_count: int
-    final_feedback: FinalFeedback | None  # null until the interview is completed
+    # null until scored: added in the background a few seconds after the interview is completed
+    final_feedback: FinalFeedback | None
     created_at: datetime
     updated_at: datetime
 
@@ -74,6 +89,7 @@ class QuestionResponse(BaseModel):
     id: uuid.UUID
     interview_id: uuid.UUID
     order_no: int
+    sub_no: int  # 0 = main question, 1 = follow-up to main question order_no
     text: str
     concept: str
     difficulty: QuestionDifficulty
@@ -111,5 +127,5 @@ class AnswerResponse(BaseModel):
 class AnswerSubmitResponse(BaseModel):
     answer: AnswerResponse
     next_question: QuestionResponse | None  # None when that was the last question
-    feedback: FinalFeedback | None  # only after the last answer
-    interview: InterviewResponse  # shows status "completed" and overall_score at the end
+    feedback: FinalFeedback | None  # null now: scoring happens in the background, see GET /interviews/{id}
+    interview: InterviewResponse  # status "completed" after the last answer

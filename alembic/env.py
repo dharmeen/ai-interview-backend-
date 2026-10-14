@@ -9,6 +9,7 @@ from src.utils.settings import settings
 from src.utils.db import Base
 from src.user import models  # noqa: F401  (registers User on Base.metadata)
 from src.interview import models as interview_models  # noqa: F401
+from src.billing import models as billing_models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

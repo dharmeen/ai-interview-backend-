@@ -9,7 +9,8 @@ from src.utils.settings import settings
 
 logger = logging.getLogger(__name__)
 
-Tier = Literal["small", "large"]
+# fast = no thinking, for steps the user waits on; small = questions; large = final feedback
+Tier = Literal["fast", "small", "large"]
 
 # MiniMax models may put their reasoning in the reply as <think>...</think>
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -39,7 +40,7 @@ def _get_client() -> openai.OpenAI:
 
 
 def _model_for(tier: Tier) -> str:
-    return settings.LLM_MODEL_SMALL if tier == "small" else settings.LLM_MODEL_LARGE
+    return {"fast": settings.LLM_MODEL_FAST, "small": settings.LLM_MODEL_SMALL, "large": settings.LLM_MODEL_LARGE}[tier]
 
 
 def _extract_json(text: str) -> dict:
@@ -74,6 +75,9 @@ def _check_value(name: str, value, rules: dict):
             raise LLMError(f"AI reply: '{name}' should be a whole number")
         if not rules.get("minimum", value) <= value <= rules.get("maximum", value):
             raise LLMError(f"AI reply: '{name}' is out of range")
+    elif rules["type"] == "boolean":
+        if not isinstance(value, bool):
+            raise LLMError(f"AI reply: '{name}' should be true or false")
     elif rules["type"] == "array":
         if not isinstance(value, list):
             raise LLMError(f"AI reply: '{name}' should be a list")
@@ -83,7 +87,7 @@ def _check_value(name: str, value, rules: dict):
 
 def _check_schema(data: dict, schema: dict) -> None:
     """Small check for the simple schemas we use: required keys, strings, enums, integers with
-    minimum/maximum, and lists of those.
+    minimum/maximum, booleans, and lists of those.
     Models don't always follow the requested format, so we verify it ourselves."""
     for key in schema.get("required", []):
         if key not in data:
@@ -94,13 +98,22 @@ def _check_schema(data: dict, schema: dict) -> None:
 
 
 def generate_json(
-    system: str, prompt: str, schema: dict, tier: Tier = "small", max_tokens: int = 16000
+    system: str,
+    prompt: str,
+    schema: dict,
+    tier: Tier = "small",
+    max_tokens: int = 16000,
+    timeout: float | None = None,
 ) -> dict:
     """Asks the model for JSON matching `schema` and returns it as a dict.
 
+    `timeout` (seconds) is for calls a user is waiting on: it gives up after that long, with no
+    retry and no fallback model, so the caller can carry on without the AI.
     Raises LLMError on any failure. Error messages never include the API key.
     """
     client = _get_client()
+    if timeout is not None:
+        client = client.with_options(timeout=timeout, max_retries=0)
     format_rules = (
         "\n\nReply with only one JSON object, no other text and no markdown. "
         f"It must match this JSON Schema:\n{json.dumps(schema)}"
@@ -111,7 +124,7 @@ def generate_json(
     ]
     # main model first; if it's overloaded or rate limited, try the fallback model once
     models = [_model_for(tier)]
-    if settings.LLM_MODEL_FALLBACK and settings.LLM_MODEL_FALLBACK not in models:
+    if timeout is None and settings.LLM_MODEL_FALLBACK and settings.LLM_MODEL_FALLBACK not in models:
         models.append(settings.LLM_MODEL_FALLBACK)
 
     for model in models:

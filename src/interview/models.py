@@ -36,6 +36,7 @@ class QuestionDifficulty(str, enum.Enum):
 class QuestionSource(str, enum.Enum):
     PLANNED = "planned"  # comes from the topic plan
     CONCEPT_SWITCH = "concept_switch"  # asked after switching away from a concept
+    FOLLOW_UP = "follow_up"  # digs into the candidate's previous answer
 
 
 def _enum_column(enum_cls: type[enum.Enum]) -> Enum:
@@ -61,6 +62,9 @@ class Interview(Base):
     level: Mapped[InterviewLevel] = mapped_column(_enum_column(InterviewLevel), nullable=False)
     experience_years: Mapped[int] = mapped_column(Integer, nullable=False)
     job_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # plain text read from the uploaded CV; required for new interviews (null only on old rows)
+    resume_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resume_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     interview_type: Mapped[InterviewType] = mapped_column(_enum_column(InterviewType), nullable=False)
     num_questions: Mapped[int] = mapped_column(Integer, default=5, server_default="5", nullable=False)
     status: Mapped[InterviewStatus] = mapped_column(
@@ -73,9 +77,13 @@ class Interview(Base):
     # ordered list of concept names, one per question; filled by POST /interviews/{id}/start
     topic_plan: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     current_question_no: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    # 0 = the main question current_question_no is waiting for an answer, 1 = its follow-up is
+    current_sub_no: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     switch_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     # {"summary": str, "strengths": [str], "improvements": [str]}; filled once when the interview ends
     final_feedback: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # "free" or "paid": which credit paid for it; null until the interview starts
+    credit_type: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -88,13 +96,15 @@ class Interview(Base):
 class Question(Base):
     __tablename__ = "questions"
     # one question per position, so two parallel requests can't both save question 1
-    __table_args__ = (UniqueConstraint("interview_id", "order_no"),)
+    __table_args__ = (UniqueConstraint("interview_id", "order_no", "sub_no"),)
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     interview_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("interviews.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    order_no: Mapped[int] = mapped_column(Integer, nullable=False)  # 1, 2, 3...
+    order_no: Mapped[int] = mapped_column(Integer, nullable=False)  # main question number: 1, 2, 3...
+    # 0 = the main question, 1 = a follow-up to it (it shares the main question's order_no)
+    sub_no: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     concept: Mapped[str] = mapped_column(String(200), nullable=False)
     difficulty: Mapped[QuestionDifficulty] = mapped_column(_enum_column(QuestionDifficulty), nullable=False)
