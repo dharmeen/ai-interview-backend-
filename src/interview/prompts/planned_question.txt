@@ -17,10 +17,17 @@ The concept for this question is: <concept>{concept}</concept>
 
 This is a {kind} question. {kind_guide}
 
+Difficulty: {difficulty_note}
+
+Questions the candidate was already asked in earlier rounds. Never repeat or reword any of them:
+<previous_questions>
+{previous_questions}
+</previous_questions>
+
 Guidelines:
 - Ask exactly one question about that concept, the way a real interviewer would say it out loud.
 - Never invent details that are not in the resume.
-- Match the difficulty to the candidate's level and experience. Earlier questions should be easier.
+- Match the difficulty to the candidate's level, experience and the round difficulty above. Earlier questions in this interview should be easier than later ones.
 - The candidate answers in plain text, so do not ask them to draw diagrams or write long programs.
 - Keep it under 70 words.
 - Set "difficulty" to easy, medium or hard to describe the question you wrote.

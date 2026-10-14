@@ -51,6 +51,34 @@ def _enum_column(enum_cls: type[enum.Enum]) -> Enum:
     )
 
 
+class InterviewProfile(Base):
+    """The details of an interview set-up, saved so the user can pick them again next time.
+    One per role per user; every interview made from it is a new, harder round."""
+
+    __tablename__ = "interview_profiles"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(100), nullable=False)
+    level: Mapped[InterviewLevel] = mapped_column(_enum_column(InterviewLevel), nullable=False)
+    experience_years: Mapped[int] = mapped_column(Integer, nullable=False)
+    interview_type: Mapped[InterviewType] = mapped_column(_enum_column(InterviewType), nullable=False)
+    num_questions: Mapped[int] = mapped_column(Integer, nullable=False)
+    job_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resume_text: Mapped[str] = mapped_column(Text, nullable=False)
+    resume_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # bumped on every use, so the most recent profile is listed first
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class Interview(Base):
     __tablename__ = "interviews"
 
@@ -58,6 +86,15 @@ class Interview(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
+    # the saved profile this was made from; deleting the profile keeps the interview
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("interview_profiles.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # 1 = first interview on this profile; each later round is asked to be harder
+    difficulty_round: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    # questions from earlier rounds on the same profile, so they aren't asked again:
+    # [{"concept": str, "text": str}], newest first; saved when the interview is created
+    previous_questions: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
     role: Mapped[str] = mapped_column(String(100), nullable=False)
     level: Mapped[InterviewLevel] = mapped_column(_enum_column(InterviewLevel), nullable=False)
     experience_years: Mapped[int] = mapped_column(Integer, nullable=False)

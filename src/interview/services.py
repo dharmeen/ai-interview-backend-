@@ -2,6 +2,7 @@ import logging
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
@@ -12,6 +13,8 @@ from src.interview import prompts, speech
 from src.interview.models import (
     Answer,
     Interview,
+    InterviewLevel,
+    InterviewProfile,
     InterviewStatus,
     InterviewType,
     Question,
@@ -33,12 +36,37 @@ QUESTION_NOT_FOUND = "Question not found"
 NOT_CURRENT_QUESTION = "You can only answer the current question"
 AI_UNAVAILABLE = "Our AI interviewer is busy right now. Please try starting the interview again in a minute."
 NOT_COMPLETED = "Interview is not completed yet"
+PROFILE_NOT_FOUND = "Saved profile not found"
+RESUME_REQUIRED = "Upload your resume, or pick a saved profile."
+AI_UNAVAILABLE_RESUME = "Couldn't read the details from your resume right now. Please fill them in."
+COACH_TOO_EARLY = "Answer a couple of questions first"
+AI_UNAVAILABLE_COACH = "No coaching tip right now."
 VOICE_UNAVAILABLE = "The interviewer's voice is not available right now. You can still read the question."
 AI_UNAVAILABLE_FEEDBACK = "Our AI interviewer is busy right now. Your answers are saved, please try again in a minute."
 AI_UNAVAILABLE_SUGGESTIONS ="Role suggestions are not available right now."
 AI_UNAVAILABLE_ANSWER ="Our AI interviewer is busy right now. Your answer was not saved, please submit it again in a minute."
 
 MAX_CONCEPT_LENGTH = 200  # matches Question.concept
+
+# saved profiles and rounds
+MAX_PROFILES_LISTED = 20
+PROFILE_FIELDS = (
+    "id", "role", "level", "experience_years", "interview_type", "num_questions",
+    "job_description", "resume_filename", "updated_at",
+)
+# how many earlier questions the AI is told to avoid; enough for ~5 past rounds, short enough for a prompt
+MAX_HISTORY_QUESTIONS = 40
+# what each round on the same profile asks of the AI; the last one repeats for later rounds
+DIFFICULTY_NOTES = (
+    "This is their first round: use the normal difficulty for their level and experience.",
+    "This is round 2: make it noticeably harder than a first round. Fewer basics, more 'how' and "
+    "'why' questions, and ask for trade-offs.",
+    "This is round 3: make it harder again. Go into trade-offs, edge cases, failure handling and "
+    "what changes at larger scale.",
+    "This is round 4 or later: make it the hardest yet for their level, like a demanding "
+    "interviewer testing a strong candidate: design decisions, edge cases, debugging under "
+    "pressure, and what would break first.",
+)
 
 # questions are written at the same time; more than this risks the provider's rate limit
 MAX_PARALLEL_AI_CALLS = 5
@@ -49,11 +77,26 @@ FEEDBACK_ATTEMPTS = 2
 FOLLOW_UP_TIMEOUT_SECONDS = 6.0
 # shorter answers ("I don't know", "no idea") have nothing to follow up on, so skip the AI call
 MIN_ANSWER_FOR_FOLLOW_UP = 25
+# coaching pop-up: needs a couple of answers to see a pattern, and looks at the last few
+COACH_MIN_ANSWERS = 2
+RESUME_DETAILS_TIMEOUT_SECONDS = 15.0
+# (minimum years, level), highest first; matches the rules in the resume_details prompt
+LEVEL_BY_YEARS = (
+    (6, InterviewLevel.SENIOR),
+    (3, InterviewLevel.MID),
+    (1, InterviewLevel.JUNIOR),
+    (0, InterviewLevel.FRESHER),
+)
+COACH_RECENT_ANSWERS = 3
+COACH_TIMEOUT_SECONDS = 15.0
+COACH_CACHE_SIZE = 500
 
 # background jobs running in this process, so a request can wait for one instead of repeating it
 _jobs_lock = threading.Lock()
 _preparing: dict[uuid.UUID, threading.Event] = {}
 _scoring: set[uuid.UUID] = set()
+# coach tips already made, keyed by (interview id, number of answers); a dict keeps insertion order
+_coach_tips: dict[tuple[uuid.UUID, int], dict] = {}
 
 # A real interview mixes question kinds instead of only walking through the CV.
 # The order is fixed here (not left to the AI) so every interview gets a fair mix:
@@ -114,6 +157,26 @@ FOLLOW_UP_SCHEMA = {
     "required": ["follow_up", "question", "difficulty"],
     "additionalProperties": False,
 }
+RESUME_DETAILS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "role": {"type": "string"},
+        "experience_years": {"type": "integer", "minimum": 0, "maximum": 40},  # matches InterviewCreate
+        "level": {"type": "string", "enum": [lv.value for lv in InterviewLevel]},
+    },
+    "required": ["role", "experience_years", "level"],
+    "additionalProperties": False,
+}
+COACH_TIP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "headline": {"type": "string"},
+        "tips": {"type": "array", "items": {"type": "string"}},
+        "encouragement": {"type": "string"},
+    },
+    "required": ["headline", "tips", "encouragement"],
+    "additionalProperties": False,
+}
 ROLE_SUGGESTIONS_SCHEMA = {
     "type": "object",
     "properties": {"roles": {"type": "array", "items": {"type": "string"}}},
@@ -133,18 +196,160 @@ FINAL_FEEDBACK_SCHEMA = {
 }
 
 
+def _get_profile(db: Session, user: User, profile_id: uuid.UUID) -> InterviewProfile:
+    # filtered by user too, so someone else's profile looks exactly like a missing one
+    profile = db.scalar(
+        select(InterviewProfile).where(InterviewProfile.id == profile_id, InterviewProfile.user_id == user.id)
+    )
+    if profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=PROFILE_NOT_FOUND)
+    return profile
+
+
+def _started_count(db: Session, profile_id: uuid.UUID) -> int:
+    """Interviews actually started from the profile: one that was only created isn't a round."""
+    return db.scalar(
+        select(func.count()).select_from(Interview).where(
+            Interview.profile_id == profile_id, Interview.status != InterviewStatus.CREATED
+        )
+    )
+
+
+def _question_history(db: Session, profile_id: uuid.UUID) -> list[dict]:
+    """Main questions from earlier rounds on this profile, newest first, so they aren't asked again."""
+    rows = db.execute(
+        select(Question.concept, Question.text)
+        .join(Interview, Interview.id == Question.interview_id)
+        .where(Interview.profile_id == profile_id, Interview.status != InterviewStatus.CREATED, Question.sub_no == 0)
+        .order_by(Interview.created_at.desc(), Question.order_no)
+        .limit(MAX_HISTORY_QUESTIONS)
+    ).all()
+    return [{"concept": concept, "text": text} for concept, text in rows]
+
+
 def create_interview(
-    db: Session, user: User, data: InterviewCreate, resume_text: str, resume_filename: str
+    db: Session,
+    user: User,
+    data: InterviewCreate,
+    resume: tuple[str, str] | None,
+    profile_id: uuid.UUID | None = None,
 ) -> Interview:
+    """Creates the interview and saves its details as a profile for next time.
+    With a profile (picked, or found by the same role) this is its next round: harder, and
+    without the questions asked before. `resume` is (text, file name); None = the profile's."""
     # 402 early, before the user fills in everything; the credit itself is spent on start
     billing.check_can_create(user, data.num_questions)
+
+    if profile_id is not None:
+        profile = _get_profile(db, user, profile_id)
+    else:
+        # one profile per role: typing the same role again continues it instead of starting over
+        profile = db.scalar(
+            select(InterviewProfile)
+            .where(InterviewProfile.user_id == user.id, func.lower(InterviewProfile.role) == data.role.lower())
+            .order_by(InterviewProfile.updated_at.desc())
+            .limit(1)
+        )
+    if resume is None:
+        if profile is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=RESUME_REQUIRED)
+        resume = (profile.resume_text, profile.resume_filename)
+    resume_text, resume_filename = resume
+
+    # save what was filled in, so next time the form comes back filled
+    fields = {**data.model_dump(), "resume_text": resume_text, "resume_filename": resume_filename}
+    if profile is None:
+        profile = InterviewProfile(user_id=user.id, **fields)
+        db.add(profile)
+        db.flush()  # gives it an id
+        difficulty_round, history = 1, []
+    else:
+        for key, value in fields.items():
+            setattr(profile, key, value)
+        profile.updated_at = func.now()  # listed first next time, even if nothing changed
+        difficulty_round = _started_count(db, profile.id) + 1
+        history = _question_history(db, profile.id)
+
     interview = Interview(
-        user_id=user.id, resume_text=resume_text, resume_filename=resume_filename, **data.model_dump()
+        user_id=user.id,
+        profile_id=profile.id,
+        difficulty_round=difficulty_round,
+        previous_questions=history,
+        **fields,
     )
     db.add(interview)
     db.commit()
     db.refresh(interview)
     return interview
+
+
+def read_resume_details(resume_text: str, resume_filename: str) -> dict:
+    """Reads the target role, years of experience and level from a resume, to fill in the form.
+    Nothing is saved; the user can still change every field."""
+    try:
+        data = generate_json(
+            system=prompts.load("system"),
+            prompt=prompts.render(
+                "resume_details",
+                resume=prompts.escape_user_text(resume_text),
+                today=date.today().strftime("%B %Y"),  # for jobs that run "to Present"
+            ),
+            schema=RESUME_DETAILS_SCHEMA,
+            tier="fast",  # the user is waiting with the form open
+            max_tokens=500,
+            timeout=RESUME_DETAILS_TIMEOUT_SECONDS,
+        )
+    except LLMError as e:
+        logger.info("Could not read resume details: %s", e)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AI_UNAVAILABLE_RESUME)
+
+    role = " ".join(data["role"].split())[:MAX_ROLE_LENGTH]
+    years = data["experience_years"]
+    # the level follows from the years, so it always matches them; the AI may only raise it
+    # (e.g. a "Lead Engineer" title with 5 years)
+    by_years = next(level for min_years, level in LEVEL_BY_YEARS if years >= min_years)
+    order = list(InterviewLevel)
+    level = max(by_years, InterviewLevel(data["level"]), key=order.index)
+    return {
+        "role": role if len(role) >= 2 else None,
+        "experience_years": years,
+        "level": level,
+        "resume_filename": resume_filename,
+    }
+
+
+def list_profiles(db: Session, user: User) -> list[dict]:
+    """The user's saved profiles, most recently used first, with how far they've got on each."""
+    profiles = db.scalars(
+        select(InterviewProfile)
+        .where(InterviewProfile.user_id == user.id)
+        .order_by(InterviewProfile.updated_at.desc())
+        .limit(MAX_PROFILES_LISTED)
+    ).all()
+    result = []
+    for profile in profiles:
+        rounds_done = _started_count(db, profile.id)
+        last_score = db.scalar(
+            select(Interview.overall_score)
+            .where(Interview.profile_id == profile.id, Interview.overall_score.is_not(None))
+            .order_by(Interview.created_at.desc())
+            .limit(1)
+        )
+        result.append(
+            {
+                **{c: getattr(profile, c) for c in PROFILE_FIELDS},
+                "rounds_done": rounds_done,
+                "next_round": rounds_done + 1,
+                "last_score": last_score,
+            }
+        )
+    return result
+
+
+def delete_profile(db: Session, user: User, profile_id: uuid.UUID) -> None:
+    """Removes a saved profile. Its interviews and reports stay."""
+    db.delete(_get_profile(db, user, profile_id))
+    db.commit()
 
 
 MAX_ROLE_SUGGESTIONS = 6
@@ -213,8 +418,13 @@ def get_interview(db: Session, user: User, interview_id: uuid.UUID, lock: bool =
     return interview
 
 
+def _difficulty_note(difficulty_round: int) -> str:
+    return DIFFICULTY_NOTES[min(difficulty_round, len(DIFFICULTY_NOTES)) - 1]
+
+
 def _interview_context(interview: Interview) -> dict:
     """Placeholder values shared by the prompts. User-typed text is escaped."""
+    history = interview.previous_questions or []
     return {
         "role": prompts.escape_user_text(interview.role),
         "job_description": prompts.escape_user_text(interview.job_description),
@@ -223,31 +433,57 @@ def _interview_context(interview: Interview) -> dict:
         "experience_years": interview.experience_years,
         "interview_type": interview.interview_type.value,
         "num_questions": interview.num_questions,
+        "difficulty_round": interview.difficulty_round,
+        "difficulty_note": _difficulty_note(interview.difficulty_round),
+        # earlier rounds on the same profile: the AI must not ask these again
+        "previous_concepts": prompts.escape_user_text(
+            "\n".join(dict.fromkeys(f"- {q['concept']}" for q in history))  # unique, order kept
+        ),
+        "previous_questions": prompts.escape_user_text("\n".join(f"- {q['text']}" for q in history)),
     }
 
 
-def _build_topic_plan(interview: Interview) -> list[str]:
-    data = generate_json(
-        system=prompts.load("system"),
-        prompt=prompts.render(
-            "topic_plan",
-            **_interview_context(interview),
-            slots="\n".join(f"{i}. {kind}" for i, kind in enumerate(_question_kinds(interview), 1)),
-        ),
-        schema=TOPIC_PLAN_SCHEMA,
-        tier="fast",  # /start may be waiting for it
-    )
-    # clean up: trim, drop blanks and duplicates, keep within the column size
-    concepts: list[str] = []
-    for raw in data["concepts"]:
-        concept = str(raw).strip()[:MAX_CONCEPT_LENGTH]
-        if concept and concept.lower() not in {c.lower() for c in concepts}:
-            concepts.append(concept)
+def _concept_key(concept: str) -> str:
+    return " ".join(concept.lower().split())
 
-    # the schema can't force an exact list length, so check it here
-    if len(concepts) < interview.num_questions:
-        raise LLMError(f"Topic plan too short: {len(concepts)} of {interview.num_questions}")
-    return concepts[: interview.num_questions]
+
+def _build_topic_plan(interview: Interview) -> list[str]:
+    prompt = prompts.render(
+        "topic_plan",
+        **_interview_context(interview),
+        slots="\n".join(f"{i}. {kind}" for i, kind in enumerate(_question_kinds(interview), 1)),
+    )
+    earlier = {_concept_key(q["concept"]) for q in interview.previous_questions or []}
+
+    for attempt in range(2):
+        data = generate_json(
+            system=prompts.load("system"),
+            prompt=prompt,
+            schema=TOPIC_PLAN_SCHEMA,
+            tier="fast",  # /start may be waiting for it
+        )
+        # clean up: trim, drop blanks and duplicates, keep within the column size
+        concepts: list[str] = []
+        for raw in data["concepts"]:
+            concept = str(raw).strip()[:MAX_CONCEPT_LENGTH]
+            if concept and _concept_key(concept) not in {_concept_key(c) for c in concepts}:
+                concepts.append(concept)
+
+        # the schema can't force an exact list length, so check it here
+        if len(concepts) < interview.num_questions:
+            raise LLMError(f"Topic plan too short: {len(concepts)} of {interview.num_questions}")
+        concepts = concepts[: interview.num_questions]
+
+        # the fast model sometimes reuses a topic from an earlier round: ask once more, naming them
+        repeated = [c for c in concepts if _concept_key(c) in earlier]
+        if not repeated or attempt == 1:
+            return concepts
+        prompt += (
+            "\n\nYour last answer reused these concepts from earlier rounds: "
+            + "; ".join(prompts.escape_user_text(c) for c in repeated)
+            + ". Replace each with a new concept of the same kind."
+        )
+    return concepts
 
 
 def _generate_planned_question(interview: Interview, question_no: int) -> Question:
@@ -517,6 +753,58 @@ def _answered(db: Session, interview_id: uuid.UUID) -> list[tuple[Question, Answ
             .order_by(Question.order_no, Question.sub_no)
         ).tuples().all()
     )
+
+
+def get_coach_tip(db: Session, user: User, interview_id: uuid.UUID) -> dict:
+    """A short coaching tip from the latest answers, shown as a pop-up during the interview so the
+    candidate can do better on the rest. Only for the candidate: it doesn't change any score."""
+    interview = get_interview(db, user, interview_id)
+    if interview.status != InterviewStatus.IN_PROGRESS:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=NOT_IN_PROGRESS)
+    answered = _answered(db, interview_id)
+    if len(answered) < COACH_MIN_ANSWERS:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=COACH_TOO_EARLY)
+
+    key = (interview_id, len(answered))
+    with _jobs_lock:
+        if key in _coach_tips:
+            return _coach_tips[key]  # e.g. the page was reloaded: don't pay for it twice
+
+    recent = answered[-COACH_RECENT_ANSWERS:]
+    transcript = "\n\n".join(
+        f"<question>{prompts.escape_user_text(q.text)}</question>\n<answer>{prompts.escape_user_text(a.answer_text)}</answer>"
+        for q, a in recent
+    )
+    context = _interview_context(interview)
+    db.rollback()  # don't keep a transaction open during the AI call
+    try:
+        data = generate_json(
+            system=prompts.load("system"),
+            prompt=prompts.render("coach_tip", **context, transcript=transcript),
+            schema=COACH_TIP_SCHEMA,
+            tier="fast",
+            max_tokens=1500,
+            timeout=COACH_TIMEOUT_SECONDS,
+        )
+    except LLMError as e:
+        logger.info("No coach tip for interview %s: %s", interview_id, e)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AI_UNAVAILABLE_COACH)
+
+    tips = _clean_points(data["tips"], limit=3)
+    headline = data["headline"].strip()
+    if not tips or not headline:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AI_UNAVAILABLE_COACH)
+    tip = {
+        "headline": headline,
+        "tips": tips,
+        "encouragement": data["encouragement"].strip(),
+        "after_answers": len(answered),
+    }
+    with _jobs_lock:
+        if len(_coach_tips) >= COACH_CACHE_SIZE:
+            _coach_tips.pop(next(iter(_coach_tips)))  # the oldest
+        _coach_tips[key] = tip
+    return tip
 
 
 def needs_feedback(interview: Interview) -> bool:

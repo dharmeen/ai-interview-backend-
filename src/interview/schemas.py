@@ -40,7 +40,47 @@ class InterviewCreateForm(InterviewCreate):
     """POST /interviews body, sent as multipart/form-data so the CV file can come with it.
     The file lives in the same model because FastAPI can't mix a form model with a separate File()."""
 
-    resume: UploadFile  # required: questions are based on the CV
+    # a saved profile to build on (next, harder round); its resume is used if no new file is sent
+    profile_id: uuid.UUID | None = None
+    # required unless profile_id is given: questions are based on the CV
+    resume: UploadFile | None = None
+
+
+class ProfileResponse(BaseModel):
+    """A saved interview set-up the user can pick again. The resume text itself is not sent back."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    role: str
+    level: InterviewLevel
+    experience_years: int
+    interview_type: InterviewType
+    num_questions: int
+    job_description: str | None
+    resume_filename: str
+    rounds_done: int  # interviews started from this profile
+    next_round: int  # the round a new interview from it would be (harder each time)
+    last_score: float | None  # score of the latest completed round
+    updated_at: datetime
+
+
+class ResumeDetails(BaseModel):
+    """What the AI read from an uploaded resume, to pre-fill the new-interview form."""
+
+    role: str | None  # null if it couldn't tell
+    experience_years: int
+    level: InterviewLevel
+    resume_filename: str
+
+
+class CoachTip(BaseModel):
+    """A short coaching pop-up shown during the interview, based on the latest answers."""
+
+    headline: str
+    tips: list[str]
+    encouragement: str
+    after_answers: int  # how many answers it was based on
 
 
 class RoleSuggestions(BaseModel):
@@ -62,6 +102,8 @@ class InterviewResponse(BaseModel):
     experience_years: int
     job_description: str | None
     resume_filename: str | None  # the resume text itself is not sent back
+    profile_id: uuid.UUID | None
+    difficulty_round: int  # 1 = first round on this profile; higher = harder questions
     interview_type: InterviewType
     num_questions: int
     status: InterviewStatus

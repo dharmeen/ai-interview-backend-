@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, Response, UploadFile, status
 from sqlalchemy.orm import Session
 
 from src.interview import services
@@ -10,12 +10,15 @@ from src.interview.schemas import (
     AnswerCreate,
     AnswerResponse,
     AnswerSubmitResponse,
+    CoachTip,
     InterviewCreate,
     InterviewCreateForm,
     InterviewListResponse,
     InterviewResponse,
     InterviewStartResponse,
+    ProfileResponse,
     QuestionResponse,
+    ResumeDetails,
     RoleSuggestions,
 )
 from src.user.dependencies import get_current_user
@@ -28,19 +31,33 @@ router = APIRouter(prefix="/interviews", tags=["Interviews"])
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=InterviewResponse)
 def create_interview(
-    # multipart/form-data: the interview fields plus the resume file (PDF or DOCX, max 5 MB)
+    # multipart/form-data: the interview fields, plus the resume file (PDF or DOCX, max 5 MB)
+    # and/or profile_id of a saved profile to continue with
     form: Annotated[InterviewCreateForm, Form()],
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    resume_text, resume_filename = read_resume(form.resume)
-    data = InterviewCreate.model_validate(form.model_dump(exclude={"resume"}))
-    interview = services.create_interview(db, current_user, data, resume_text, resume_filename)
+    # browsers may send an empty file part when nothing was chosen
+    has_file = form.resume is not None and bool(form.resume.filename)
+    resume = read_resume(form.resume) if has_file else None
+    data = InterviewCreate.model_validate(form.model_dump(exclude={"resume", "profile_id"}))
+    interview = services.create_interview(db, current_user, data, resume, form.profile_id)
     # write all the questions now, while the user reads the details page, so /start is instant
     services.mark_preparing(interview.id)
     background_tasks.add_task(services.prepare_interview, interview.id)
     return interview
+
+
+@router.post("/resume-details", response_model=ResumeDetails)
+def resume_details(
+    resume: Annotated[UploadFile, File(description="CV as PDF or DOCX, max 5 MB")],
+    current_user: User = Depends(get_current_user),
+):
+    """Reads the target role, years of experience and level from a resume, to fill in the
+    new-interview form as soon as the file is picked. Nothing is saved."""
+    resume_text, resume_filename = read_resume(resume)
+    return services.read_resume_details(resume_text, resume_filename)
 
 
 # declared before "/{interview_id}" so "role-suggestions" isn't read as an interview id
@@ -140,3 +157,36 @@ def question_audio(
     audio = services.get_question_audio(db, current_user, interview_id, question_id)
     # private: only this user may see it; a question's text never changes, so the browser can keep it
     return Response(content=audio, media_type="audio/mpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@router.post("/{interview_id}/coach-tip", response_model=CoachTip)
+def coach_tip(
+    interview_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """A short tip on how to score better on the remaining questions, from the latest answers.
+    Shown to the candidate as a pop-up; it doesn't affect the score."""
+    return services.get_coach_tip(db, current_user, interview_id)
+
+
+# saved interview set-ups, so the user can pick one again next time (a harder round each time)
+profiles_router = APIRouter(prefix="/profiles", tags=["Profiles"])
+
+
+@profiles_router.get("", response_model=list[ProfileResponse])
+def list_profiles(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return services.list_profiles(db, current_user)
+
+
+@profiles_router.delete("/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_profile(
+    profile_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Removes the saved profile; interviews made from it stay."""
+    services.delete_profile(db, current_user, profile_id)

@@ -24,7 +24,15 @@ What each kind needs:
 - scenario: a realistic on-the-job situation for this role, named by its problem, for example "Slow API under heavy traffic" or "Production bug found after release".
 - behavioural: an HR or soft-skill topic, for example "Handling conflict in a team" or "Working under a tight deadline".
 
+Difficulty: {difficulty_note}
+
+Concepts already covered in the candidate's earlier rounds:
+<previous_concepts>
+{previous_concepts}
+</previous_concepts>
+Every concept must be new: do not reuse any concept from that list, not even with slightly different wording. For resume concepts, first use resume items (projects, jobs, tools) that are not in the list yet. Only when none are left, return to a covered item with a clearly different angle, and name that angle, for example "Payments service: handling partial failures".
+
 Guidelines:
-- Fit the depth to the level and years of experience.
+- Fit the depth to the level and years of experience, and to the difficulty above.
 - Cover different areas of the role. Do not let the resume decide every topic: the concept and scenario questions should test what the role needs, including areas the resume does not show.
 - No duplicates or near-duplicates.
